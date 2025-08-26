@@ -1,0 +1,17 @@
+v 3
+d GSP Kit: search, wave/rows exporters, and stacked graphs for the GSP dataset
+d Author: Sahan S. Karataşlı
+d Requires: Stata 14.2 or newer
+d Version: 1.0.0
+d Distribution-Date: 26aug2025
+
+f gspgraph.ado
+f gspgraph.sthlp
+f gsp2rows.ado
+f gsp2rows.sthlp
+f gspwave.ado
+f gspwave.sthlp
+f gspstack.ado
+f gspstack.sthlp
+f gspstackh.ado
+f gspstackh.sthlp
