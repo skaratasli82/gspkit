@@ -3,7 +3,8 @@ program define gspstackh, rclass
     syntax varlist(min=1 numeric) [if] [in], ///
         [ YEARVAR(name) YRANGE(numlist min=2 max=2) ///
           TITLE(string asis) NOTE(string asis) NOTESIZE(string) ///
-          OUTGRAPH(string asis) STRICT DEBUG XOPTS(string asis) ]
+          OUTGRAPH(string asis) STRICT DEBUG ///
+          XOPTS(string asis) ]
 
     * ---- year variable ----
     if ("`yearvar'"=="") {
@@ -30,70 +31,141 @@ program define gspstackh, rclass
 
     * ---- strict 0/1 (optional) ----
     if ("`strict'"!="") {
-        foreach v of varlist `varlist' {
-            capture assert inlist(`v',0,1,.) 
+        foreach v of local varlist {
+            capture assert inlist(`v',0,1) | missing(`v')
             if _rc {
-                di as err "`v' has non-binary values; use option -strict- only with 0/1 vars."
-                exit 109
+                di as err "Variable {bf:`v'} is not 0/1 (or missing)."
+                exit 9
             }
         }
     }
 
-    * ---- apply if/in filter ----
     preserve
-    keep `if' `in' `yearv' `varlist'
-    drop if missing(`yearv')
+        marksample touse
+        keep if `touse'
 
-    * ---- restrict to yrange ----
-    if ("`yrange'"!="") {
-        local y1 : word 1 of `yrange'
-        local y2 : word 2 of `yrange'
-        keep if inrange(`yearv',`y1',`y2')
-    }
-    quietly summarize `yearv', meanonly
-    local ymin = r(min)
-    local ymax = r(max)
+        * yrange filter (optional)
+        if ("`yrange'"!="") {
+            tokenize "`yrange'"
+            local ymin `1'
+            local ymax `2'
+            keep if inrange(`yearv', `ymin', `ymax')
+        }
 
-    * ---- collapse to yearly sums ----
-    collapse (sum) `varlist', by(`yearv')
+        * keep needed vars; missing→0
+        keep `yearv' `varlist'
+        foreach v of local varlist {
+            replace `v' = 0 if missing(`v')
+        }
 
-    * ---- pad missing years ----
-    rangejoin `yearv' = `ymin'/`ymax', by(`yearv')
-    foreach v of varlist `varlist' {
-        replace `v' = 0 if missing(`v')
-    }
+        * collapse to annual sums
+        collapse (sum) `varlist', by(`yearv')
 
-    * ---- convert to percent shares ----
-    egen total = rowtotal(`varlist')
-    foreach v of varlist `varlist' {
-        gen double p_`v' = 100*`v'/total
-    }
+        * no data guard
+        count
+        if r(N)==0 {
+            di as err "No observations after filters; nothing to plot."
+            restore
+            exit 2000
+        }
 
-    * ---- debugging option ----
-    if ("`debug'"!="") {
-        list `yearv' total p_*
-    }
+        * ===== store only the years that exist pre-padding (for clean xlabels) =====
+        levelsof `yearv', local(_xlab_present)
 
-    * ---- graph ----
-    twoway area ///
-        `=subinstr("`varlist'"," ", " ", .)' ///
-        `yearv', ///
-        stack ///
-        ylabel(0(20)100, angle(0)) ///
-        xtitle("Year") ytitle("Percent") ///
-        `title' `note' `notesize' ///
-        `xopts'
+        * min/max years
+        summarize `yearv', meanonly
+        local miny = r(min)
+        local maxy = r(max)
+        if ("`yrange'"!="") {
+            local miny = `ymin'
+            local maxy = `ymax'
+        }
+        if (`maxy' < `miny') {
+            di as err "Invalid year range (min>max)."
+            restore
+            exit 198
+        }
 
-    * ---- outgraph ----
-    if ("`outgraph'"!="") {
-        graph export "`outgraph'", replace
-    }
+        * save collapsed, build full year sequence, merge (pad missing years)
+        tempfile collapsed allyears
+        save `collapsed', replace
 
-    * ---- returned ----
-    return local vars "`varlist'"
-    return local year "`yearv'"
-    return scalar ymin = `ymin'
-    return scalar ymax = `ymax'
+        clear
+        set obs `= `maxy' - `miny' + 1'
+        gen `yearv' = `miny' + _n - 1
+        save `allyears', replace
 
+        use `allyears', clear
+        merge 1:1 `yearv' using `collapsed', nogenerate
+        foreach v of local varlist {
+            replace `v' = 0 if missing(`v')
+        }
+        sort `yearv'
+
+        * =========================
+        * >>> 100% SHARE TRANSFORM
+        * =========================
+        egen double _total = rowtotal(`varlist')
+        foreach v of local varlist {
+            gen double p_`v' = cond(_total>0, 100*`v'/_total, 0)
+        }
+
+        * ---- stacked bands (on percentages) ----
+        tempvar base
+        gen double `base' = 0
+        local i = 0
+        local twplots ""
+        local ordlist ""
+        local labopts ""
+
+        foreach v of local varlist {
+            local ++i
+            gen double hi_`i' = `base' + p_`v'
+            gen double lo_`i' = `base'
+            replace `base' = hi_`i'
+
+            local lbl : variable label `v'
+            if "`lbl'"=="" local lbl "`v'"
+            local lbl = subinstr("`lbl'", `"""', `"""""', .)
+
+            local twplots `"`twplots' (rarea lo_`i' hi_`i' `yearv', lwidth(none))"'
+            local ordlist `ordlist' `i'
+            local labopts `labopts' label(`i' "`lbl'")
+        }
+
+        * titles/notes (escape quotes)
+        local ttl `"`title'"'
+        if "`ttl'" != "" {
+            local ttl = subinstr("`ttl'", `"""', `"""""', .)
+            local ttlopt `"`"title("`ttl'")'"''
+        }
+        else local ttlopt ""
+
+        local nto ""
+        if ("`note'"!="") {
+            local ntxt = subinstr("`note'", `"""', `"""""', .)
+            if ("`notesize'"!="") local nto `"note("`ntxt'", size(`notesize'))"'
+            else                  local nto `"note("`ntxt'")"'
+        }
+
+        * ---- graph: 0–100 fixed scale for percent shares ----
+        local xlo = `= `miny' - 0.5'
+        local xhi = `= `maxy' + 0.5'
+
+        twoway `twplots', `ttlopt' ///
+            xscale(range(`xlo' `xhi')) ///
+            yscale(range(0 100)) ///
+            ytitle("Percent of annual total") xtitle("Year") ///
+            xlabel(`_xlab_present') ///
+            legend(order(`ordlist') `labopts') `nto' ///
+            plotregion(margin(zero)) graphregion(color(white)) ///
+            ylabel(0(20)100, angle(horizontal)) name(GSPSTACKH, replace) ///
+            `xopts'
+
+        * returns
+        return scalar ymin = `miny'
+        return scalar ymax = `maxy'
+        return local year = "`yearv'"
+        return local vars = "`varlist'"
     restore
 end
